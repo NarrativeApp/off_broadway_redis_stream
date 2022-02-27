@@ -29,6 +29,9 @@ defmodule OffBroadwayRedisStream.Producer do
 
     * `:make_stream` - Optional. Appends MKSTREAM subcommand to `XGROUP CREATE` which automatically create the stream if it doesn't exist. See [XGROUP CREATE](https://redis.io/commands/xgroup). Default is false
 
+    * `delete_on_acknowledgment` - Optional. When `XACK`ing a message also
+      `XDEL`ete it. Defaults to `false`
+
   ## Acknowledgments
 
   Both successful and failed messages are acknowledged by default. Use `Broadway.Message.configure_ack/2` to change this behaviour for failed messages. If a message configured to retry, that message will be attempted again in next batch.
@@ -65,7 +68,8 @@ defmodule OffBroadwayRedisStream.Producer do
     max_pending_ack: 100_000,
     redis_command_retry_timeout: 300,
     group_start_id: "$",
-    make_stream: false
+    make_stream: false,
+    delete_on_acknowledgment: false
   ]
 
   @impl GenStage
@@ -115,6 +119,28 @@ defmodule OffBroadwayRedisStream.Producer do
   @impl GenStage
   def handle_info(:receive_messages, state) do
     receive_messages(%{state | receive_timer: nil})
+  end
+
+  @impl GenStage
+  def handle_info({:ack, ack_ids, retryable}, %{delete_on_acknowledgment: true} = state) do
+    ids = state.pending_ack ++ ack_ids
+    state = %{state | retryable: state.retryable ++ retryable}
+
+    with :ok <- redis_cmd(:ack, [ids], state, 0),
+         :ok <- redis_cmd(:delete_message, [ids], state, 0) do
+      {:noreply, [], %{state | pending_ack: []}}
+    else
+      {:error, error} ->
+        Logger.warn(
+          "Unable to acknowledge and delete messages with Redis. Reason: #{inspect(error)}"
+        )
+
+        if length(ids) > state.max_pending_ack do
+          {:stop, "Pending ack count is more than maximum limit #{state.max_pending_ack}", state}
+        else
+          {:noreply, [], %{state | pending_ack: ids}}
+        end
+    end
   end
 
   @impl GenStage
@@ -411,7 +437,8 @@ defmodule OffBroadwayRedisStream.Producer do
          :ok <- validate_option(:receive_interval, opts[:receive_interval]),
          :ok <- validate_option(:allowed_missed_heartbeats, opts[:allowed_missed_heartbeats]),
          :ok <- validate_option(:heartbeat_interval, opts[:heartbeat_interval]),
-         :ok <- validate_option(:make_stream, opts[:make_stream]) do
+         :ok <- validate_option(:make_stream, opts[:make_stream]),
+         :ok <- validate_option(:delete_on_acknowledgment, opts[:delete_on_acknowledgment]) do
       :ok
     end
   end
@@ -444,6 +471,9 @@ defmodule OffBroadwayRedisStream.Producer do
 
   defp validate_option(:make_stream, value) when not is_boolean(value),
     do: validation_error(:make_stream, "a boolean", value)
+
+  defp validate_option(:delete_on_acknowledgment, value) when not is_boolean(value),
+    do: validation_error(:delete_on_acknowledgment, "a boolean", value)
 
   defp validate_option(_, _), do: :ok
 
